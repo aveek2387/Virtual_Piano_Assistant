@@ -240,6 +240,17 @@ td.num{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
 .toggle small{display:block;color:var(--muted)}
 .status{font-family:var(--f-mono);font-size:12px;color:var(--ivory-dim);min-height:1.4em}
 .status.good{color:var(--good)}.status.bad{color:var(--bad)}.status.warn{color:var(--warn)}
+select{background:rgba(0,0,0,.35);color:var(--ivory);border:1px solid var(--line);border-radius:10px;padding:7px 10px;font:inherit;width:100%;min-width:0}
+input[type=range]{accent-color:var(--brass);width:100%}
+.field{display:grid;gap:4px}
+.micbox{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.mictog{border:1px solid var(--line);background:rgba(255,255,255,.04);border-radius:99px;padding:3px 12px;font-family:var(--f-mono);font-size:12px;color:var(--ivory-dim);cursor:pointer}
+.mictog:hover{border-color:var(--brass)}
+.mictog[aria-pressed="true"]{background:var(--curtain);border-color:var(--curtain-2);color:var(--ivory)}
+.mictog[aria-pressed="true"]::before{content:"● ";color:var(--bad)}
+.meter{width:64px;height:8px;border-radius:99px;background:rgba(0,0,0,.45);border:1px solid rgba(233,185,73,.25);overflow:hidden}
+.meter i{display:block;height:100%;width:100%;transform-origin:left;transform:scaleX(0);background:linear-gradient(90deg,var(--good),var(--brass) 70%,var(--bad))}
+.heard{color:var(--brass-2);min-width:3.2em}
 textarea{width:100%;background:rgba(0,0,0,.35);color:var(--ivory);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-family:var(--f-mono);font-size:12px;resize:vertical}
 
 /* Overlays */
@@ -295,6 +306,7 @@ footer{font-size:12px;color:var(--muted);text-align:center;padding-block:4px 10p
   <section class="pianobox" aria-label="Piano keyboard">
     <div class="piano-head">
       <span class="qhelp">Computer keys <b>A W S E D F T G Y H U J K</b> from <b id="qBase">C4</b> · <kbd>Z</kbd> <kbd>X</kbd> shift octave</span>
+      <span class="micbox"><button class="mictog" id="micTog" aria-pressed="false">Listen to my piano</button><span class="meter" id="micMeter" hidden aria-hidden="true"><i></i></span><span class="heard" id="micHeard" hidden></span></span>
       <span id="inputStatus">Input: mouse, touch or computer keys</span>
     </div>
     <div class="piano-scroll" id="pianoScroll"><div class="piano" id="piano"></div></div>
@@ -403,7 +415,7 @@ const CRITICS = {
 const KEY = 'marquee-maestro-v1';
 const DEF = () => ({v:1, xp:0, bestCombo:0, lastBackup:0,
   skills:Object.fromEntries(SKILL_ORDER.map(s=>[s,{level:1,hist:[],played:0,correct:0,mastered:false}])),
-  auditions:[], settings:{sfx:true,piano:true,labels:true,qwerty:true,strict:true}});
+  auditions:[], settings:{sfx:true,piano:true,labels:true,qwerty:true,strict:true,micDevice:'',micSens:3}});
 const fin = x => typeof x==='number' && Number.isFinite(x);
 const numIn = (x,lo,hi,def) => fin(x) ? clamp(x,lo,hi) : def;
 function sanitize(d){
@@ -424,7 +436,9 @@ function sanitize(d){
     };
   });
   const st = (d.settings && typeof d.settings==='object') ? d.settings : {};
-  Object.keys(base.settings).forEach(key=>{ if(typeof st[key]==='boolean') base.settings[key]=st[key]; });
+  Object.keys(base.settings).forEach(key=>{ if(typeof base.settings[key]==='boolean' && typeof st[key]==='boolean') base.settings[key]=st[key]; });
+  if(typeof st.micDevice==='string' && st.micDevice.length<=300) base.settings.micDevice=st.micDevice;
+  base.settings.micSens = Math.round(numIn(st.micSens,1,5,3));
   base.auditions = (Array.isArray(d.auditions)?d.auditions:[]).map(a=>{
     if(!a || typeof a!=='object' || !a.per || typeof a.per!=='object') return null;
     const per = {};
@@ -454,14 +468,28 @@ const FOOT_WARN = 'This browser is blocking storage, so progress is lost when yo
 let S = load();
 
 /* ---------- Audio ---------- */
-let ac = null, master = null;
+let ac = null, master = null, comp = null;
+// When the app itself makes sound, the microphone would hear it; remember when (performance clock, ms).
+let selfUntil = 0; const selfClicks = [];
+const outLat = a => ((a.outputLatency||0)+(a.baseLatency||0))*1000;
+// One steady clock for the metronome and the microphone. The audio clock is read in bursts, so the
+// smallest recent gap between performance.now() and audio time is the truest link between them.
+const clk = {o:new Float64Array(128).fill(Infinity), t:new Float64Array(128), i:0, off:0};
+function clockSample(o){
+  const now=performance.now(); clk.o[clk.i&127]=o; clk.t[clk.i&127]=now; clk.i++;
+  let m=Infinity; for(let k=0;k<128;k++) if(now-clk.t[k]<3000 && clk.o[k]<m) m=clk.o[k];
+  clk.off = m===Infinity ? o : m;
+}
+// Context time (s) → performance.now() time (ms) when that moment is heard from the speakers.
+function ctxPerf(a, t){ clockSample(performance.now()-a.currentTime*1000); return t*1000 + clk.off + outLat(a); }
+function markSelf(a, when, dur){ selfUntil = Math.max(selfUntil, performance.now() + (when+dur)*1000 + outLat(a) + 60); }
 function audio(){
   if(!ac){
     const C = window.AudioContext || window.webkitAudioContext;
     if(!C) return null;
     ac = new C();
     master = ac.createGain(); master.gain.value = .55;
-    const comp = ac.createDynamicsCompressor();
+    comp = ac.createDynamicsCompressor();
     master.connect(comp); comp.connect(ac.destination);
   }
   if(ac.state === 'suspended') ac.resume();
@@ -470,6 +498,7 @@ function audio(){
 function tone(midi, when=0, dur=1.4, vel=.8){
   const a = audio(); if(!a) return;
   const t = a.currentTime + when + .005, f = 440*Math.pow(2,(midi-69)/12);
+  markSelf(a, when, dur*.75);
   const g = a.createGain();
   g.gain.setValueAtTime(0,t);
   g.gain.linearRampToValueAtTime(.32*vel,t+.006);
@@ -485,9 +514,19 @@ function tone(midi, when=0, dur=1.4, vel=.8){
     o.connect(og); og.connect(lp); o.start(t); o.stop(t+dur+.05);
   });
 }
+// Silence anything the app is still playing (a finished chord, applause) when the player moves on,
+// so it doesn't linger or keep the microphone waiting.
+function hush(){
+  if(!ac || !master) return;
+  const old=master, t=ac.currentTime; old.gain.setTargetAtTime(0,t,.015); setTimeout(()=>{ try{ old.disconnect(); }catch(e){} },300);
+  master=ac.createGain(); master.gain.value=.55; master.connect(comp);
+  selfUntil=Math.min(selfUntil, performance.now()+outLat(ac)+90);
+}
 function click(when=0, accent=false, quiet=false){
   const a = audio(); if(!a) return;
   const t = a.currentTime + when;
+  selfClicks.push(ctxPerf(a, t));
+  while(selfClicks.length>40) selfClicks.shift();
   const o = a.createOscillator(), g = a.createGain();
   o.type='square'; o.frequency.value = accent?1760:1175;
   const v = quiet?.05:.14;
@@ -500,6 +539,7 @@ function sfx(kind){
   if(kind==='good'){ [76,83].forEach((m,i)=>tone(m,i*.07,.5,.35)); }
   else if(kind==='bad'){
     const t=a.currentTime, o=a.createOscillator(), g=a.createGain();
+    markSelf(a, 0, .3);
     o.type='sawtooth'; o.frequency.setValueAtTime(180,t); o.frequency.exponentialRampToValueAtTime(110,t+.25);
     g.gain.setValueAtTime(.06,t); g.gain.exponentialRampToValueAtTime(.0001,t+.28);
     o.connect(g); g.connect(master); o.start(t); o.stop(t+.3);
@@ -510,6 +550,7 @@ function sfx(kind){
 }
 function applause(){
   const a = audio(); if(!a) return;
+  markSelf(a, 0, 2.2);
   const len = a.sampleRate*2.2, buf = a.createBuffer(1,len,a.sampleRate), d = buf.getChannelData(0);
   for(let i=0;i<len;i++){ const env = Math.min(1,i/(a.sampleRate*.2))*Math.max(0,1-i/len); d[i]=(Math.random()*2-1)*env*(Math.random()<.08?1:.25); }
   const src=a.createBufferSource(); src.buffer=buf;
@@ -596,11 +637,11 @@ function hint(midis){ midis.forEach(m=>{ if(keyEls[m]){ keyEls[m].classList.add(
 function hintPc(pc){ const ms=[]; for(let m=LOW;m<=HIGH;m++) if(mod(m,12)===pc) ms.push(m); hint(ms); }
 function clearHints(){ hinted.forEach(m=>keyEls[m]&&keyEls[m].classList.remove('hint')); hinted=[]; }
 
-function noteOn(m, src='screen'){
+function noteOn(m, src='screen', at){
   if(S.settings.piano && src!=='mic') tone(m);
   flash(m,'down',220);
   if(cur && !cur.done){
-    if(cur.onTap) cur.onTap();
+    if(cur.onTap) cur.onTap(at);
     else if(cur.onNote) cur.onNote(m, src);
   }
 }
@@ -744,7 +785,7 @@ const GEN = {
       <div class="notechips">${notes.map((n,i)=>`<div class="nc ${got.has(n.pc)?'ok':''}"><small>${['root','3rd','5th','7th'][i]}</small>${got.has(n.pc)?n.label:'?'}</div>`).join('')}</div></div>`; };
     const voicing = () => { let r=48+mod(NOTE_PC[root[0]]+root[1],12); if(r<53) r+=12; return Q[q][0].map(s=>r+s); };
     return {
-      _t:{pcs:req, labels:notes.map(n=>n.label)},
+      _t:{pcs:req, labels:notes.map(n=>n.label)}, poly:true,
       title:`Build this chord`, sub:`Play its ${req.length} notes in any order, any octave`,
       mount(v){ vis=v; draw(); },
       onNote(m){
@@ -754,7 +795,7 @@ const GEN = {
           if(!got.has(pc)){ got.add(pc); draw();
             if(got.size===req.length){
               const score=Math.max(0,1-.34*mistakes);
-              setTimeout(()=>voicing().forEach(n=>tone(n,0,1.6,.6)),250);
+              const me=cur; setTimeout(()=>{ if(cur===me) voicing().forEach(n=>tone(n,0,1.6,.6)); },250);
               api.finish(score, mistakes?{k:`chord:${q}`}:null, `${sym} = ${notes.map(n=>n.label).join(' – ')}.`+(mistakes?` ${mistakes} wrong note${mistakes>1?'s':''} on the way.`:''));
             }
           }
@@ -830,8 +871,7 @@ const GEN = {
       if(countIn) for(let i=0;i<4;i++) click(t0-a.currentTime+i*spb, i===0);
       for(let b=0;b<beats;b++) click(barStart-a.currentTime+b*spb, b%4===0, true);
       if(withTones) onsets.forEach(o=>tone(72,barStart-a.currentTime+o*spb,.35,.6));
-      const lat=((a.outputLatency||0)+(a.baseLatency||0))*1000;
-      perfBar = performance.now()+(barStart-a.currentTime)*1000+lat;
+      perfBar = ctxPerf(a, barStart);
       const head=vis.querySelector('.playhead'), cnt=vis.querySelector('.countin');
       cancelAnimationFrame(raf);
       const loop=()=>{
@@ -883,9 +923,9 @@ const GEN = {
         };
         v.querySelector('#tapPad').addEventListener('pointerdown', e=>{ e.preventDefault(); self.onTap(); });
       },
-      onTap(){
+      onTap(at){
         const pad=vis.querySelector('#tapPad'); pad.classList.add('flash'); setTimeout(()=>pad.classList.remove('flash'),90);
-        const now=performance.now();
+        const now = fin(at) ? at : performance.now();
         if(state!=='rec'){ if(state==='idle') api.feedback('Press Start, wait for the four clicks, then tap.','warn'); return; }
         if(now<startT||now>endT) return;
         taps.push(now);
@@ -989,7 +1029,7 @@ function startPractice(skill, level){
   combo=0; setView('stage'); nextExercise();
 }
 function nextExercise(){
-  clearTimeout(advanceT); clearHints();
+  clearTimeout(advanceT); clearHints(); hush();
   if(cur && cur.cleanup) cur.cleanup();
   if(run.mode==='audition' && run.i>=run.queue.length) return endAudition();
   let skill, level;
@@ -1076,7 +1116,7 @@ function setView(v){
   view=v;
   document.body.classList.toggle('stage-mode', v==='stage');
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on', b.dataset.view===v || (v==='stage' && b.dataset.view==='practice' && run && run.mode==='practice')));
-  if(v!=='stage'){ if(cur&&cur.cleanup) cur.cleanup(); cur=null; run=null; clearTimeout(advanceT); clearHints(); }
+  if(v!=='stage'){ if(cur&&cur.cleanup) cur.cleanup(); cur=null; run=null; clearTimeout(advanceT); clearHints(); if(v!=='report') hush(); }
   render();
   window.scrollTo({top:0, behavior: reduced()?'auto':'smooth'});
 }
@@ -1297,10 +1337,13 @@ function renderSettings(){
       ${tg('strict','Strict octave in sight-reading','Must play the exact written key, not just the right letter.')}
     </section>
     <section class="panel stack"><h2 style="font-size:22px">Play your real piano</h2>
-      <p class="muted">Connect a digital piano by USB (MIDI) or let the app listen through your microphone. Browsers only allow both on a page you host yourself; inside this preview they may be blocked.</p>
+      <p class="muted">Play an acoustic or digital piano and the app listens through your microphone or any connected recording device, so you never need the on-screen keys. A digital piano can also connect by USB (MIDI). Both work on a page you host yourself over https; inside a preview window they may be blocked.</p>
+      <div class="field"><label class="eyebrow" for="micSel">Recording device</label><select id="micSel">${micOptions()}</select></div>
+      <div class="field"><label class="eyebrow" for="set-micSens">Sensitivity · <span id="sensVal">${SENS_NAMES[S.settings.micSens]}</span></label>
+        <input type="range" id="set-micSens" min="1" max="5" step="1" value="${S.settings.micSens}"></div>
+      <div class="row"><button class="btn primary" id="btnMic">${mic.on?'Stop listening':'Listen with microphone'}</button><span class="status" id="micStatus">${micStatus}</span></div>
       <div class="row"><button class="btn" id="btnMidi">Connect MIDI keyboard</button><span class="status" id="midiStatus">${midiStatus}</span></div>
-      <div class="row"><button class="btn" id="btnMic">Listen with microphone</button><span class="status" id="micStatus">${micStatus}</span></div>
-      <p class="muted" style="font-size:13px">Mic mode hears one note at a time, so play chords as broken chords. In sight-reading it accepts the right letter in any octave.</p>
+      <p class="muted" style="font-size:13px">For the best results: place the phone or laptop near the piano, stay quiet for the first second while it measures the room, and use headphones in Rhythm Tap so the metronome stays out of the microphone. In Chord Builder you can play the whole chord at once; elsewhere play one note at a time. In sight-reading any octave counts. Raise the sensitivity for a quiet piano or a distant mic, lower it in a noisy room.</p>
     </section>
     <section class="panel stack"><h2 style="font-size:22px">Your record</h2>
       <p class="muted">${S.auditions.length} audition${S.auditions.length===1?'':'s'}, ${S.xp.toLocaleString()} XP, best combo ×${S.bestCombo}. Last export: <b id="lastExport">${S.lastBackup?new Date(S.lastBackup).toLocaleString(undefined,{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'never'}</b>.</p>
@@ -1314,7 +1357,10 @@ function renderSettings(){
       <div class="row"><button class="btn" id="btnReset">Reset all progress</button></div>
     </section></div>`;
   ['piano','sfx','labels','qwerty','strict'].forEach(id=>{ $('#set-'+id).onchange=e=>{ S.settings[id]=e.target.checked; save(); applyPianoPrefs(); }; });
-  $('#btnMidi').onclick=connectMIDI; $('#btnMic').onclick=connectMic;
+  $('#btnMidi').onclick=connectMIDI; $('#btnMic').onclick=toggleMic;
+  $('#micSel').onchange=e=>{ S.settings.micDevice=e.target.value; save(); if(mic.on){ stopMic(); startMic(); } };
+  $('#set-micSens').oninput=e=>{ S.settings.micSens=clamp(Math.round(+e.target.value),1,5); $('#sensVal').textContent=SENS_NAMES[S.settings.micSens]; save(); };
+  refreshDevices();
   $('#btnDownload').onclick=downloadProgress; $('#btnCopy').onclick=copyProgress;
   $('#btnRestoreCode').onclick=()=>restoreFrom($('#codeBox').value);
   $('#btnPickFile').onclick=()=>$('#fileIn').click();
@@ -1327,7 +1373,7 @@ function renderSettings(){
 }
 
 /* ---------- Real piano input ---------- */
-function setStatus(which, text){ if(which==='midi') midiStatus=text; else micStatus=text; const el=$('#'+which+'Status'); if(el) el.textContent=text; $('#inputStatus').textContent='Input: '+text; }
+function setStatus(which, text){ if(which==='midi') midiStatus=text; else micStatus=text; const el=$('#'+which+'Status'); if(el) el.textContent=text; $('#inputStatus').textContent='Input: '+(which==='mic' && text==='Off' ? 'mouse, touch or computer keys' : which==='mic' && mic.ready && !mic.fallbackMsg ? 'your piano, through the microphone' : text); }
 async function connectMIDI(){
   if(!navigator.requestMIDIAccess){ setStatus('midi','This browser has no Web MIDI. Try Chrome or Edge.'); return; }
   try{
@@ -1337,40 +1383,305 @@ async function connectMIDI(){
   }catch(e){ setStatus('midi','MIDI was blocked here. It works when you host the app yourself.'); }
 }
 function onMidi(e){ const [st,d,v]=e.data; const c=st&0xf0; if(c===0x90&&v>0) noteOn(d,'midi'); }
-let micOn=false;
-async function connectMic(){
-  if(micOn) return;
+/* ---------- Real piano through the microphone ----------
+   Audio arrives in 512-sample hops (AudioWorklet, or ScriptProcessor as a fallback).
+   Each hop: noise gate, spectral-flux onset detection, McLeod pitch (MPM) for single notes.
+   Chord Builder adds a multi-pitch pass (harmonic salience with iterative subtraction). */
+const SENS_NAMES = ['','Low','Medium-low','Medium','Medium-high','High'];
+const SENS = {gate:[0,5,3.6,2.6,1.9,1.4], rise:[0,3,2.4,2,1.7,1.5], flux:[0,3,2.5,2.1,1.8,1.5]};
+const RING = 32768, HOP = 512, CAL_HOPS = 80;
+const WORKLET = `class T extends AudioWorkletProcessor{constructor(){super();this.b=new Float32Array(${HOP});this.n=0;}
+process(i){const c=i[0]&&i[0][0];if(c){for(let k=0;k<c.length;k++){this.b[this.n++]=c[k];if(this.n===${HOP}){this.port.postMessage({d:this.b,f:currentFrame+k+1},[this.b.buffer]);this.b=new Float32Array(${HOP});this.n=0;}}}return true;}}
+registerProcessor('mm-tap',T);`;
+const mic = {on:false, ready:false, busy:false, stream:null, nodes:[], devices:[], heard:[], ring:new Float32Array(RING), sr:48000, W:2048, level:0};
+const median = a => { if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); return s[s.length>>1]; };
+const esc = t => String(t).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* FFT (radix-2, in place) */
+const fftCache = {};
+function fftTables(n){
+  if(fftCache[n]) return fftCache[n];
+  const bits=Math.log2(n), rev=new Uint32Array(n), cos=new Float32Array(n/2), sin=new Float32Array(n/2);
+  for(let i=0;i<n;i++){ let r=0,x=i; for(let b=0;b<bits;b++){ r=(r<<1)|(x&1); x>>=1; } rev[i]=r; }
+  for(let i=0;i<n/2;i++){ cos[i]=Math.cos(2*Math.PI*i/n); sin[i]=-Math.sin(2*Math.PI*i/n); }
+  return fftCache[n]={rev,cos,sin};
+}
+function fft(re, im, inverse=false){
+  const n=re.length, {rev,cos,sin}=fftTables(n);
+  for(let i=0;i<n;i++){ const j=rev[i]; if(j>i){ let t=re[i]; re[i]=re[j]; re[j]=t; t=im[i]; im[i]=im[j]; im[j]=t; } }
+  for(let size=2; size<=n; size<<=1){
+    const half=size>>1, step=n/size;
+    for(let i=0;i<n;i+=size) for(let k=0;k<half;k++){
+      const c=cos[k*step], s=inverse?-sin[k*step]:sin[k*step], a=i+k, b=a+half;
+      const tr=re[b]*c-im[b]*s, ti=re[b]*s+im[b]*c;
+      re[b]=re[a]-tr; im[b]=im[a]-ti; re[a]+=tr; im[a]+=ti;
+    }
+  }
+  if(inverse) for(let i=0;i<n;i++){ re[i]/=n; im[i]/=n; }
+}
+const hannOf = n => Float32Array.from({length:n}, (_,i)=>.5-.5*Math.cos(2*Math.PI*i/(n-1)));
+function allocMic(){
+  const W=mic.W; mic.sRe={}; mic.sIm={}; mic.sHann={}; mic.sPre={}; mic.sPost={};
+  for(const N of [W, 2*W, 4*W]){ mic.sRe[N]=new Float32Array(N); mic.sIm[N]=new Float32Array(N); mic.sHann[N]=hannOf(N); mic.sPre[N]=new Float32Array(N/2); mic.sPost[N]=new Float32Array(N/2); }
+  Object.assign(mic, {fRe:new Float32Array(W), fIm:new Float32Array(W), hann:hannOf(W), magA:new Float32Array(W/2), magB:new Float32Array(W/2)});
+}
+function latest(n, out){ const e=mic.frame; for(let i=0;i<n;i++) out[i]=mic.ring[(e-n+i)&(RING-1)]; }
+// Frame number → performance clock (ms) of the moment the sound reached the microphone.
+function framePerf(fr){ return fr/mic.sr*1000 + clk.off - mic.inLat; }
+
+/* Log spectral flux: how much new energy arrived (onset strength) */
+function spectralFlux(){
+  const N=mic.W, re=mic.fRe, im=mic.fIm, h=mic.hann;
+  latest(N, re); for(let i=0;i<N;i++){ re[i]*=h[i]; im[i]=0; } fft(re,im);
+  const kmin=Math.max(1,Math.floor(50/mic.sr*N)), kmax=Math.min(N/2-1,Math.floor(6000/mic.sr*N));
+  const now=mic.magA, prev=mic.magB; let fl=0;
+  for(let k=kmin;k<=kmax;k++){
+    const v=Math.hypot(re[k],im[k])/N; now[k]=v;
+    const d=Math.log1p(1000*v)-Math.log1p(1000*prev[k]); if(d>0) fl+=d;
+  }
+  mic.magA=prev; mic.magB=now;
+  return fl;
+}
+// Sharpen the onset time to ~1.5 ms and measure how much the attack stands out. Uses the
+// high-frequency part of the signal (first difference), where a hammer strike shows up clearly
+// and a held low note does not make the energy wobble.
+function preciseOnset(){
+  const C=64, K=48, e=mic.frame, en=[];
+  for(let c=0;c<K;c++){ let s=0; const st=e-(K-c)*C; let prev=mic.ring[(st-1)&(RING-1)];
+    for(let i=0;i<C;i++){ const v=mic.ring[(st+i)&(RING-1)], d=v-prev; prev=v; s+=d*d; } en.push(s); }
+  let bc=16, br=0;
+  for(let c=16;c<K;c++){ const r=en[c]/((en[c-1]+en[c-2]+en[c-3])/3+1e-12); if(r>br){ br=r; bc=c; } }
+  const before=avg(en.slice(bc-16,bc-1)), after=avg(en.slice(bc,Math.min(K,bc+6)));
+  const frame=e-(K-bc)*C;
+  return {frame, at:framePerf(frame), rise:after/(before+1e-12)};
+}
+
+/* Which notes started at an onset: compare the spectrum just after the attack with the one just
+   before it, keep only the new energy, then find the notes whose harmonics explain it
+   (harmonic salience with Klapuri weights, pick the best, subtract its partials, repeat). */
+function specAt(endFrame, N, out){
+  const re=mic.sRe[N], im=mic.sIm[N], h=mic.sHann[N];
+  for(let i=0;i<N;i++){ re[i]=mic.ring[(endFrame-N+i)&(RING-1)]*h[i]; im[i]=0; }
+  fft(re,im); for(let k=0;k<N/2;k++) out[k]=Math.hypot(re[k],im[k]);
+}
+function notesIn(mag, N, maxNotes, raw, strict){
+  const half=N/2, bin=mic.sr/N, fmax=Math.min(5000, mic.sr/2.2);
+  const band=[]; for(let k=Math.floor(60/bin);k<fmax/bin;k+=2) band.push(mag[k]);
+  const floor=Math.max(median(band)*10, mic.specFloor*N);
+  // strongest peak near f (± 60 cents), weighted by how close its interpolated frequency is
+  const pk=(f,sp=mag)=>{
+    const lo=Math.max(1,Math.floor(f*.965/bin)), hi=Math.min(half-2,Math.ceil(f*1.036/bin)); let v=0, at=-1;
+    for(let k=lo;k<=hi;k++) if(sp[k]>v && sp[k]>=sp[k-1] && sp[k]>=sp[k+1]){ v=sp[k]; at=k; }
+    if(at<0) return [0,-1];
+    const a=sp[at-1], b=sp[at], c=sp[at+1], den=a-2*b+c, sh=den ? .5*(a-c)/den : 0, fr=(at+sh)*bin;
+    const cents=1200*Math.log2(fr/f); return [v*Math.exp(-((cents/40)**2)), at];
+  };
+  const prom=k=>{ if(k<0) return 0; let s=0, c=0; for(let d=5; d<=9; d++){ if(k-d>0){ s+=mag[k-d]; c++; } if(k+d<half){ s+=mag[k+d]; c++; } } return mag[k]/(s/c+1e-9); };
+  const orig=Float32Array.from(mag), used=new Uint8Array(half);
+  const found=[], shape=[1,.85,.5,.2]; let first=0;
+  const evalCand=m=>{
+    const f0=440*Math.pow(2,(m-69)/12), amps=[], bins=[];
+    for(let hh=1;hh<=10;hh++){ const fh=hh*f0*Math.sqrt(1+.0003*hh*hh); if(fh>fmax) break; const [v,at]=pk(fh); amps.push(v); bins.push(at); }
+    if(!amps.length) return null;
+    const amax=Math.max(...amps); if(amps[0] < (m<50?.1:.3)*amax) return null;   // a piano note's own fundamental must be there
+    if(prom(bins[0]) < (m<50?1.8:3)) return null;                                 // and stand out as a peak (knocks and clicks are flat)
+    let s=0; for(let k=0;k<amps.length;k++) s+=(f0+27)/((k+1)*f0+320)*amps[k];
+    return {m, s, amps, bins};
+  };
+  // Spectral smoothness: if only every 2nd (or 3rd) partial is strong, the real note is an octave (or twelfth) up.
+  const lopsided=(amps,k)=>{ let co=0, non=0; amps.forEach((a,i)=>{ if((i+1)%k===0) co+=a; else non+=a; }); return amps.length>=2*k && non < .3*co; };
+  for(let it=0; it<maxNotes; it++){
+    let c=null;
+    const all=[]; for(let m=40;m<=96;m++){ if(found.includes(m)) continue; const e=evalCand(m); if(e){ all.push(e); if(!c || e.s>c.s) c=e; } }
+    // A real note clearly beats every candidate that isn't harmonically related to it.
+    if(c && maxNotes===1){ const rel=[0,12,19,24,-12,-19,-24]; const s2=Math.max(0,...all.filter(e=>!rel.includes(e.m-c.m)).map(e=>e.s)); if(c.s < 1.6*s2) c=null; }
+    if(c) for(const [k,up] of [[2,12],[3,19]]) if(lopsided(c.amps,k) && !found.includes(c.m+up)){ const e=evalCand(c.m+up); if(e){ c=e; break; } }
+    const best=c?c.m:-1, bs=c?c.s:0, bA=c&&c.amps, bB=c&&c.bins;
+    if(best<0 || bs<floor || (first && bs<first*.4)) break;
+    if(raw){   // most of this note's sound must be new, or it's just a note that was already ringing
+      const f0=440*Math.pow(2,(best-69)/12); let rs=0;
+      for(let hh=1;hh<=10;hh++){ const fh=hh*f0*Math.sqrt(1+.0003*hh*hh); if(fh>fmax) break; rs+=(f0+27)/(hh*f0+320)*pk(fh,raw)[0]; }
+      if(bs < (strict?.5:.35)*rs) break;
+    }
+    if(!first) first=bs;
+    found.push(best);
+    bB.forEach(b=>{ if(b>0) for(let d=-2;d<=2;d++) if(b+d>0&&b+d<half) used[b+d]=1; });
+    for(let k=0;k<bA.length;k++){
+      if(bB[k]<0) continue;
+      const nb=[bA[k-1],bA[k],bA[k+1]].filter(v=>v!==undefined), est=Math.min(mag[bB[k]], nb.reduce((a,b)=>a+b,0)/nb.length*1.2);
+      for(let d=-3; d<=3; d++){ const j=bB[k]+d; if(j>0&&j<half) mag[j]=Math.max(0, mag[j]-est*shape[Math.abs(d)]); }
+    }
+  }
+  if(!found.length) return found;
+  // The notes must explain most of the new sound; a knock, click or glitch spreads energy everywhere.
+  let all=0, mine=0; for(let k=Math.floor(60/bin);k<fmax/bin;k++){ const e=orig[k]*orig[k]; all+=e; if(used[k]) mine+=e; }
+  return mine >= (strict?.6:.45)*all ? found : [];
+}
+function detectAt(frame, N, poly, strict){
+  const pre=mic.sPre[N], post=mic.sPost[N];
+  specAt(frame-128, N, pre); specAt(frame+256+N, N, post);
+  const raw=Float32Array.from(post);
+  for(let k=0;k<N/2;k++) post[k]=Math.max(0, post[k]-.9*pre[k]);
+  const found=notesIn(post, N, poly?5:1, raw, strict);
+  // A quick repeat of a note that is still ringing can read an octave (or twelfth) high, because the
+  // ringing note's own fundamental is subtracted out. If the lower note is right there, it's the repeat.
+  // Only when that lower note's own fundamental got louder (it was struck again); a genuinely new
+  // note an octave up leaves the lower fundamental fading.
+  return found.map(m=>{
+    const now=framePerf(frame);
+    for(const r of (mic.recent||[])){
+      if(now-r.at>1500 || ![12,19,24].includes(m-r.m)) continue;
+      const lo=fundIn(raw,N,r.m);
+      if(lo > 1.25*fundIn(pre,N,r.m) && lo > .5*fundIn(raw,N,m)) return r.m;
+    }
+    return m;
+  });
+}
+function fundIn(sp, N, m){ const c=Math.round(440*Math.pow(2,(m-69)/12)/(mic.sr/N)); let v=0; for(let k=Math.max(1,c-2);k<=Math.min(N/2-1,c+2);k++) if(sp[k]>v) v=sp[k]; return v; }
+// Offline check used by the regression suite: run detection on a buffer of samples.
+function micLab(samples, sr, onsetIdx, poly){
+  if(mic.on) return null;
+  mic.sr=sr; mic.W=sr>60000?4096:2048; allocMic(); mic.ring.fill(0);
+  const N=mic.W*(poly?4:2), end=Math.min(samples.length, onsetIdx+256+N);
+  for(let i=Math.max(0,end-RING);i<end;i++) mic.ring[i&(RING-1)]=samples[i];
+  mic.frame=end; mic.specFloor=0;
+  return detectAt(onsetIdx, N, poly);
+}
+function analyse(p){
+  if(p.tap){   // Rhythm Tap: any real piano note is a tap, timed from its attack
+    const f=detectAt(p.frame, p.N, false);
+    const click = selfClicks.some(c=>Math.abs(c-p.at)<80) && f.every(m=>CLICK_MIDI.includes(m));   // the metronome, heard through the speaker
+    mic.log.push({t:p.at, found:f, tap:!click});
+    if(f.length && !click && p.at>=selfUntil && cur && cur.onTap && !cur.done){ showHeard('tap'); cur.onTap(p.at); }
+    return;
+  }
+  const found=detectAt(p.frame, p.N, p.poly, p.weak).filter(m=>!mic.recent.some(r=>r.m===m && p.at-r.at<200));
+  found.forEach(m=>mic.recent.push({m,at:p.at})); mic.recent=mic.recent.filter(r=>p.at-r.at<1500);
+  mic.log.push({t:p.at, found:[...found]}); if(mic.log.length>400) mic.log.splice(0,200);
+  if(!found.length || p.at<selfUntil || !mic.on) return;
+  mic.lastNoteT=p.at; showHeard(found.map(nameOf).join(' '));
+  found.forEach(m=>{ mic.heard.push({m,t:p.at}); if(mic.heard.length>4000) mic.heard.splice(0,2000); noteOn(m,'mic',p.at); });
+}
+
+function showHeard(t){ const e=$('#micHeard'); if(e) e.textContent=t; }
+function drawMeter(){ const i=document.querySelector('#micMeter i'); if(i) i.style.transform=`scaleX(${Math.min(1,Math.sqrt(mic.level)*2.2).toFixed(3)})`; }
+const CLICK_MIDI=[86,93];   // the metronome's two click pitches (1175 Hz and 1760 Hz)
+function onsetAt(o){
+  mic.lastOnsetT=o.at; mic.onsets.push(o.at); if(mic.onsets.length>400) mic.onsets.splice(0,200);
+  const tap = !!(cur && !cur.done && cur.onTap), poly = !tap && !!(cur && cur.poly && !cur.done), N = mic.W*(poly?4:2);
+  mic.pending.push({at:o.at, frame:o.frame, N, poly, tap, weak:o.weak});
+}
+function onHop(buf, frameEnd){
+  if(!mic.on) return;
+  const n=buf.length;
+  if(mic.frame && frameEnd-n!==mic.frame) mic.gaps=(mic.gaps||0)+1;
+  for(let i=0;i<n;i++) mic.ring[(frameEnd-n+i)&(RING-1)]=buf[i];
+  mic.frame=frameEnd; mic.hops++;
+  clockSample(performance.now()-frameEnd/mic.sr*1000);
+  let e=0, z=0, zr=0; for(let i=0;i<n;i++){ e+=buf[i]*buf[i]; if(buf[i]===0){ if(++z>zr) zr=z; } else z=0; } const rms=Math.sqrt(e/n);
+  if(zr>=32 && mic.ready){ mic.glitchUntil=frameEnd+Math.round(mic.sr*.25); mic.glitches=(mic.glitches||0)+1; }   // a dropout: the next "attack" is just the sound coming back
+  mic.rmsHist[mic.hops&7]=rms;
+  mic.level=Math.max(rms, mic.level*.8); if(mic.hops%3===0) drawMeter();
+  if(mic.hops*HOP < mic.W*6) return;                              // ring not full enough yet
+  const fl=spectralFlux();
+  if(!mic.ready){
+    mic.calR.push(rms); mic.calF.push(fl); mic.prevFl=fl;
+    if(mic.calR.length>=CAL_HOPS){
+      mic.floor=Math.max(3e-4, median(mic.calR)); mic.fluxFloor=median(mic.calF);
+      const tmp=new Float32Array(mic.W); specAt(mic.frame, mic.W, tmp); mic.specFloor=median(Array.from(tmp.subarray(4, mic.W/4)))/mic.W;
+      mic.ready=true; setStatus('mic', mic.fallbackMsg || 'Listening. Play your piano.');
+    }
+    return;
+  }
+  const s=S.settings.micSens;
+  if(rms<mic.floor) mic.floor=mic.floor*.9+rms*.1; else if(rms<mic.floor*2) mic.floor*=1.002;
+  const gate=mic.floor*SENS.gate[s]+.0015;
+  mic.fluxHist.push(fl); if(mic.fluxHist.length>14) mic.fluxHist.shift();
+  const thr=Math.max(median(mic.fluxHist)*SENS.flux[s], mic.fluxFloor*3+1.5);
+  if(fl>thr && mic.prevFl<=thr && rms>gate*.7){
+    const o=preciseOnset();
+    // a clear rise in the hammer band, or a strong burst of new partials (a soft low note under a loud high one)
+    o.weak = o.rise<=SENS.rise[s];
+    // Flux alone isn't enough when the sound is fading: lifting a key or the pedal also changes the spectrum.
+    const trend = rms/(mic.rmsHist[(mic.hops-4)&7]+1e-9);
+    // accept a clear hammer attack, or (for soft notes under louder ones) a strong burst of new partials while the level rises
+    if((!o.weak || fl>thr*3.5 || (fl>thr*2 && trend>1.05)) && o.at-mic.lastOnsetT>90 && !(mic.glitchUntil>mic.frame)) onsetAt(o);
+  }
+  mic.prevFl=fl;
+  while(mic.pending.length && mic.frame >= mic.pending[0].frame+256+mic.pending[0].N) analyse(mic.pending.shift());
+}
+
+async function startMic(){
+  if(mic.on || mic.busy) return;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ setStatus('mic','This page can’t use a microphone. Open the app from its https address.'); return; }
+  const a=audio(); if(!a){ setStatus('mic','This browser has no Web Audio.'); return; }
+  mic.busy=true; mic.fallbackMsg='';
+  const base={echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1}, want=S.settings.micDevice;
+  setStatus('mic','Asking for the microphone…');
+  let stream;
   try{
-    const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-    const a=audio(), src=a.createMediaStreamSource(stream), an=a.createAnalyser(); an.fftSize=2048; src.connect(an);
-    const buf=new Float32Array(an.fftSize); let active=-1, cand=-1, candN=0, prevRms=0;
-    micOn=true; setStatus('mic','Microphone listening');
-    setInterval(()=>{
-      an.getFloatTimeDomainData(buf);
-      const {f,rms}=detectPitch(buf,a.sampleRate);
-      if(f<0){ active=-1; cand=-1; prevRms=rms; return; }
-      const m=Math.round(69+12*Math.log2(f/440));
-      if(m===cand) candN++; else { cand=m; candN=1; }
-      const restrike = rms>prevRms*1.8 && rms>.03;
-      if(candN>=2 && (m!==active || restrike)){ active=m; noteOn(m,'mic'); }
-      prevRms=rms;
-    }, 40);
-  }catch(e){ setStatus('mic','Microphone was blocked here. It works when you host the app yourself.'); }
+    try{ stream=await navigator.mediaDevices.getUserMedia({audio: want ? {...base, deviceId:{exact:want}} : base}); }
+    catch(e){
+      if(want && /Overconstrained|NotFound/.test(e.name)){ stream=await navigator.mediaDevices.getUserMedia({audio:base}); mic.fallbackMsg='Listening on the default microphone: the chosen device isn’t connected.'; }
+      else throw e;
+    }
+  }catch(e){
+    mic.busy=false; updateMicUI();
+    setStatus('mic', /NotAllowed|Security/.test(e.name) ? 'Microphone access was blocked. Allow it from the browser’s address bar and try again.'
+      : /NotFound/.test(e.name) ? 'No microphone was found. Plug one in and try again.' : 'The microphone couldn’t start here. It works when you host the app yourself over https.');
+    return;
+  }
+  const tr=stream.getAudioTracks()[0], st=tr && tr.getSettings ? tr.getSettings() : {};
+  Object.assign(mic, {stream, sr:a.sampleRate, W:a.sampleRate>60000?4096:2048, inLat:fin(st.latency)?st.latency*1000:10,
+    frame:0, hops:0, offset:0, ready:false, calR:[], calF:[], fluxHist:[], prevFl:0,
+    lastNoteT:-1e9, lastOnsetT:-1e9, pending:[], onsets:[], log:[], recent:[], specFloor:0, level:0, glitchUntil:0, rmsHist:new Float32Array(8)});
+  allocMic();
+  if(tr) tr.onended=()=>{ if(mic.stream===stream){ stopMic(); setStatus('mic','The microphone was disconnected.'); } };
+  const src=a.createMediaStreamSource(stream), sink=a.createGain(); sink.gain.value=0; sink.connect(a.destination);
+  let node;
+  try{
+    if(!a.audioWorklet) throw new Error('no worklet');
+    if(!mic.worklet){ const url=URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'})); await a.audioWorklet.addModule(url); mic.worklet=true; }
+    node=new AudioWorkletNode(a,'mm-tap',{numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[1]});
+    node.port.onmessage=ev=>onHop(ev.data.d, ev.data.f);
+  }catch(e){
+    node=a.createScriptProcessor(HOP,1,1); let fr=Math.round(a.currentTime*a.sampleRate);
+    node.onaudioprocess=ev=>{ const d=ev.inputBuffer.getChannelData(0); fr+=d.length; onHop(Float32Array.from(d), fr); };
+  }
+  src.connect(node); node.connect(sink);
+  mic.nodes=[src,node,sink]; mic.on=true; mic.busy=false;
+  setStatus('mic','Measuring the room… stay quiet for a second.');
+  updateMicUI(); refreshDevices();
 }
-function detectPitch(buf, sr){
-  let rms=0; for(let i=0;i<buf.length;i++) rms+=buf[i]*buf[i]; rms=Math.sqrt(rms/buf.length);
-  if(rms<.012) return {f:-1,rms};
-  const minLag=Math.floor(sr/1100), maxLag=Math.min(Math.floor(sr/70), buf.length/2);
-  let best=-1, bestV=0; const c=new Float32Array(maxLag+2);
-  for(let lag=minLag; lag<=maxLag+1; lag++){ let s=0; for(let i=0;i<buf.length-lag;i++) s+=buf[i]*buf[i+lag]; c[lag]=s; }
-  let e0=0; for(let i=0;i<buf.length;i++) e0+=buf[i]*buf[i];
-  for(let lag=minLag+1; lag<=maxLag; lag++){ if(c[lag]>c[lag-1]&&c[lag]>=c[lag+1]&&c[lag]>bestV){ bestV=c[lag]; best=lag; } }
-  if(best<0 || bestV/e0<.3) return {f:-1,rms};
-  // prefer the first strong peak (avoids octave-down errors)
-  for(let lag=minLag+1; lag<best; lag++){ if(c[lag]>c[lag-1]&&c[lag]>=c[lag+1]&&c[lag]>bestV*.9){ best=lag; break; } }
-  const x1=c[best-1], x2=c[best], x3=c[best+1], den=x1-2*x2+x3, shift= den? .5*(x1-x3)/den : 0;
-  return {f: sr/(best+shift), rms};
+function stopMic(){
+  if(mic.stream) mic.stream.getTracks().forEach(t=>{ t.onended=null; t.stop(); });
+  mic.nodes.forEach(n=>{ try{ n.disconnect(); }catch(e){} if(n.port) n.port.onmessage=null; n.onaudioprocess=null; });
+  Object.assign(mic, {nodes:[], stream:null, on:false, ready:false});
+  setStatus('mic','Off'); updateMicUI();
 }
+function toggleMic(){ if(mic.on) stopMic(); else startMic(); }
+function updateMicUI(){
+  const t=$('#micTog'); t.setAttribute('aria-pressed', mic.on?'true':'false'); t.textContent = mic.on ? 'Listening' : 'Listen to my piano';
+  $('#micMeter').hidden=!mic.on; $('#micHeard').hidden=!mic.on; if(!mic.on){ showHeard(''); drawMeter(); }
+  const b=$('#btnMic'); if(b) b.textContent = mic.on ? 'Stop listening' : 'Listen with microphone';
+}
+function micOptions(){
+  const sel=S.settings.micDevice;
+  let o=`<option value="">Default recording device</option>`;
+  mic.devices.forEach((d,i)=>{ o+=`<option value="${esc(d.deviceId)}"${d.deviceId===sel?' selected':''}>${esc(d.label||('Recording device '+(i+1)))}</option>`; });
+  if(sel && !mic.devices.some(d=>d.deviceId===sel)) o+=`<option value="${esc(sel)}" selected>Saved device (not connected)</option>`;
+  return o;
+}
+async function refreshDevices(){
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    const list=await navigator.mediaDevices.enumerateDevices();
+    mic.devices=list.filter(d=>d.kind==='audioinput' && d.deviceId && d.deviceId!=='default' && d.deviceId!=='communications');
+    const s=$('#micSel'); if(s) s.innerHTML=micOptions();
+  }catch(e){}
+}
+if(navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', refreshDevices);
+$('#micTog').onclick=toggleMic;
 
 /* ---------- Keyboard ---------- */
 document.addEventListener('keydown', e=>{
@@ -1395,7 +1706,7 @@ document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
 });
 let rsT; addEventListener('resize',()=>{ clearTimeout(rsT); rsT=setTimeout(sizePiano,120); });
 buildPiano(); updateHeader(); render();
-window.__mm = { sanitize, get storageOk(){return storageOk;}, get S(){return S;}, get cur(){return cur;}, get run(){return run;}, noteOn, startAudition, startPractice, nextExercise, GEN, spellFrom };
+window.__mm = { sanitize, get storageOk(){return storageOk;}, get S(){return S;}, get cur(){return cur;}, get run(){return run;}, get mic(){return mic;}, micLab, noteOn, startAudition, startPractice, nextExercise, GEN, spellFrom };
 })();
 </script>
 

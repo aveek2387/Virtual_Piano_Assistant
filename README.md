@@ -31,12 +31,16 @@ You earn XP and combos as you go, and your rank rises from *Stagehand* to *Stree
 
 ## Ways to play
 
+- **Your real piano, through a microphone.** This is the main way to play: acoustic or digital, no cables. Press **Listen to my piano** on the keyboard bar, or open the **Green Room** to pick the recording device (built-in mic, USB mic or audio interface) and set the sensitivity. Stay quiet for the first second while it measures the room, then just play. What it hears:
+  - **Single notes** at the exact pitch, from the key's attack, including fast legato and repeated notes.
+  - **Whole chords** played together in Chord Builder.
+  - **Rhythm Tap** timing from your key strikes, with metronome clicks picked up from the speaker ignored. Headphones still help.
+  - It **ignores the app's own sounds**, knocks, releases of keys or pedal, and room noise.
 - **On-screen keyboard.** Click or tap the keys (C3 to C6).
 - **Computer keyboard.** Keys `A W S E D F T G Y H U J K` play one octave. `Z` and `X` shift the octave. `1` to `9` pick multiple-choice answers, `R` replays a sound and `Space` taps a rhythm.
-- **Real piano over MIDI.** Plug in a digital piano by USB and choose *Connect MIDI keyboard* in the Green Room. This needs Chrome or Edge.
-- **Real piano through the microphone.** Choose *Listen with microphone*. It hears one note at a time, so play chords as broken chords.
+- **Digital piano over MIDI.** Plug in by USB and choose *Connect MIDI keyboard* in the Green Room. This needs Chrome or Edge.
 
-MIDI and microphone input need a page served over https, which the GitHub Pages link is.
+Microphone and MIDI need a page served over https, which the GitHub Pages link is. For best results put the device near the piano; raise the sensitivity for a quiet piano or distant mic, lower it in a noisy room. In sight-reading any octave counts when using the microphone.
 
 ## Your progress
 
@@ -48,8 +52,8 @@ MIDI and microphone input need a page served over https, which the GitHub Pages 
 
 `index.html` is the complete app: a single self-contained HTML file with no build step, framework or tracking. Its only outside resource is Google Fonts. To host it anywhere else, copy that one file.
 
-The app is maintained from a separate source file. Every release is built with a build script and must pass a regression suite before it is published. The suite has 148 automated browser checks covering the exercise generators, adaptive scoring, persistence, import safety, phone layout at 390 px and accessibility.
+The app is maintained from a separate source file. Every release is built with a build script and must pass a regression suite before it is published. The suite has 189 automated browser checks covering the exercise generators, adaptive scoring, persistence, import safety, phone layout at 390 px, accessibility, and listening to a real piano. The listening checks run a synthesised piano through the app in real time: 24 single notes across three octaves, soft playing, repeated notes, fast legato, chords, exercises answered from the piano, rhythm timing with metronome bleed, and an accuracy benchmark of 90 random notes at varied loudness and tempo (typically 94–99% heard correctly). Offline checks also verify every note from A2 to F♯6 and 136 chords.
 
 ## Browser support
 
-Current Chrome, Edge, Firefox and Safari on desktop and mobile. Web MIDI works in Chromium-based browsers only.
+Current Chrome, Edge, Firefox and Safari on desktop and mobile. Microphone listening works in all of them; Web MIDI works in Chromium-based browsers only.
